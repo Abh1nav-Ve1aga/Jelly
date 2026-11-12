@@ -1,0 +1,15 @@
+{
+  "name": "jelly-auth-practice-backend",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "argon2": "^0.45.1",
+    "dotenv": "^18.0.9",
+    "express": "^5.0.0",
+    "google-auth-library": "^11.3.1",
+    "pg": "^8.23.1"
+  }
+}
