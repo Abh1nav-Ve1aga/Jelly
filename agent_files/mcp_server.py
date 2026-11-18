@@ -1,158 +1,155 @@
-from concurrent.futures import Future, ThreadPoolExecutor
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+#
+from threading import Lock
+from uuid import uuid4
 
 from mcp.server.fastmcp import FastMCP
 from trueforge_sdk import TrueForge
 from trueforge_sdk.types import UserMessage
 
-#servers
+# servers
 mcp = FastMCP("Jelly Handoff", host="127.0.0.1", port=8000)
 client = TrueForge(base_url="http://localhost:8790", timeout=600)
 
-#coder and teather threads -> 1 worker per
-coder_executor = ThreadPoolExecutor(max_workers=1)
-teacher_executor = ThreadPoolExecutor(max_workers=1)
+"""
+6 worker threads -> 1 per route
+threads allow us to execute and await agent turns in parallel
+"""
+executor = ThreadPoolExecutor(max_workers=6)
+"""
+works with pending dict -> prevents workers from modifying the dictionary at the same time
+only 1 thread worker can use the lock at a time -> other threads wait their turn
+"""
+state_lock = Lock()
 
-#job queues -> tied to session id
-coder_jobs: dict[str, Future] = {}
-teacher_jobs: dict[str, Future] = {}
+# agent -> agent
+Route = tuple[str, str]
+#message tuple
+QueuedMessage = tuple[str, str]  # Message ID and text
 
-#job outcome helper
-def log_job_result(job: Future) -> None:
-    try:
-        print(f"Agent job completed: {job.result()}", flush=True)
-    except Exception as error:
-        print(f"Agent job failed: {error}", flush=True)
+# Each ordered pair gets its own recipient session.
+sessions: dict[Route, str] = {}
 
-#executes an agent turn w/ session id and message
-def run_agent_turn(
-    session_id: str,
-    message: str
-):
-    #start turn stream -> process each event
+# A route stays here while its worker is scheduled or running.
+#route: queue of messages
+pending: dict[Route, deque[QueuedMessage]] = {}
+
+# Maintains the latest commit SHA of respositories
+# Repository: latest verified origin/main commit SHA
+latest_commits: dict[str, str] = {}
+
+# (Session ID, repository) -> last confirmed local checkout SHA
+session_commits: dict[tuple[str, str], str] = {}
+
+def run_agent_turn(session_id: str, message: str):
+    # create a stream -> send message to proper session
+    # with block ends stream after return
     with client.sessions.create_turn_stream(
         session_id=session_id,
         input=[UserMessage(content=message)],
     ) as events:
+        # process every return from recipient agent
         for event in events:
+            # after final turn, check for unsuccessful return
             if event.type == "turn.done":
-                #no done turn catch
                 if event.state.status != "done" or event.state.output is None:
                     raise RuntimeError(
-                        f"Session {session_id} ended with status: "
-                        f"{event.state.status}"
+                        f"Session {session_id} ended with status "
+                        f"{event.state.status} or returned no output."
                     )
-
-                #return agent response
+                # success? -> return
                 return event.state.output.content
 
-    #no return catch
+    # never returned -> error
     raise RuntimeError(f"Session {session_id} ended without a final event.")
 
-#planner -> teacher
+# process all jobs in route queue 
+def process_route_jobs(route: Route) -> None:
+    sender, recipient = route
+
+    # process all jobs
+    while True:
+        with state_lock:
+            queue = pending[route]
+            # route's queue empty -> no more jobs -> remove queue
+            if not queue:
+                del pending[route]
+                #jobs processed -> return
+                return
+
+            #job waiting -> pop it
+            message_id, message = queue.popleft()
+            session_id = sessions.get(route)
+
+        # Release the lock before calling TrueForge so other routes can run.
+        try:
+            #no history between agents -> create a route (session)
+            if session_id is None:
+                # new session with recipient agent
+                session = client.sessions.create(agent={"name": recipient})
+                session_id = session.data.id
+                # create route tied to session id
+                with state_lock:
+                    sessions[route] = session_id
+
+            # store reply of recipient agent, given the sender agent's message
+            output = run_agent_turn(
+                session_id,
+                message,
+            )
+            print(
+                f"[{message_id}] {sender} -> {recipient} "
+                f"({session_id}) completed",
+                flush=True,
+            )
+        # log route and print error
+        except Exception as error:
+            print(
+                f"[{message_id}] {sender} -> {recipient} "
+                f"({session_id or 'no session'}) failed: {error}",
+                flush=True,
+            )
+
+
 @mcp.tool()
-def start_teacher(
-    repository: str, 
-    brief_path: str, 
-    commit_sha: str
-) -> str:
-    #new session with teaching agent
-    session = client.sessions.create(agent={"name": "jelly-teaching-agent"})
-    session_id = session.data.id
+def communicate(sender: str, recipient: str, message: str) -> dict[str, str]:
+    """
+    Queue a message using exact TrueForge agent names.
 
-    #prompt to teaching agent
-    message = (
-        f"Read `{brief_path}` in `{repository}` at commit `{commit_sha}` "
-        "using GitHub MCP. Outline how you would teach the feature step by "
-        "step, then end this turn. Write the final notebook after a follow-up "
-        "provides the coder's implementation report and Git diff."
-    )
+    A queued response confirms acceptance. Replies are sent across the route with reversed
+    sender and recipient
+    """
+    # format
+    sender = sender.strip()
+    recipient = recipient.strip()
+    # ensure info is provided
+    if not sender or not recipient or not message.strip():
+        raise ValueError("Sender, recipient, and message must all be provided.")
 
-    #queue in teacher job
-    teacher_jobs[session_id] = teacher_executor.submit(
-        run_agent_turn, session_id, message
-    )
-    teacher_jobs[session_id].add_done_callback(log_job_result)
+    # create route, unique message id, and queued job
+    route = (sender, recipient)
+    message_id = uuid4().hex
+    queued_job = (message_id, message)
 
-    #return teacher session ID 
-    return session_id
+    with state_lock:
+        # worker processing jobs on route, append job
+        if route in pending:
+            pending[route].append(queued_job)
+        # no jobs running on route -> no worker
+        else:
+            pending[route] = deque([queued_job])
+            try:
+                # assign a worker to job queue to process it
+                executor.submit(process_route_jobs, route)
+            # error -> delete route (we dont want it to appear as if a worker has been assigned)
+            except RuntimeError:
+                del pending[route]
+                # re-raise error for caller
+                raise
 
-#planner -> coder
-@mcp.tool()
-def start_coder(
-    planner_message: str,
-    repository: str,
-    brief_path: str,
-    commit_sha: str,
-    teacher_session_id: str,
-) -> str:
+    return {"status": "queued", "message_id": message_id}
 
-    #ensure a teacher agent session was created
-    if teacher_session_id not in teacher_jobs:
-        raise ValueError("Call start_teacher first and pass its session ID.")
-
-    #create coder agent session
-    session = client.sessions.create(agent={"name": "jelly-coding-agent"})
-    session_id = session.data.id
-
-    #prompt to coding agent
-    message = (
-        f"Message from the planning agent:\n{planner_message}\n\n"
-        f"Read `{brief_path}` in `{repository}` at commit `{commit_sha}` "
-        "using GitHub MCP. Use that exact brief to implement the feature.\n\n"
-        "After committing the implementation report, call "
-        "`submit_implementation_report` with "
-        f"`teacher_session_id={teacher_session_id}`, "
-        f"`repository={repository}`, the `report_path`, and the `commit_sha` "
-        "of the commit that contains the implementation report.\n\n"
-        "Once the tool confirms the report was queued, return your coding "
-        "status and check results."
-    )
-
-    #queue in coding job
-    coder_jobs[session_id] = coder_executor.submit(
-        run_agent_turn, session_id, message
-    )
-    coder_jobs[session_id].add_done_callback(log_job_result)
-
-    #return coding session ID
-    return session_id
-
-#coder -> teacher
-@mcp.tool()
-def submit_implementation_report(
-    teacher_session_id: str,
-    repository: str,
-    report_path: str,
-    commit_sha: str,
-) -> str:
-    #retrieve teacher session id
-    preparation = teacher_jobs.get(teacher_session_id)
-    #no active session? -> error
-    if preparation is None:
-        raise ValueError("No teacher job found for that session ID.")
-
-    #prompt to teaching agent
-    message = (
-        "Use the `write-teaching-notebook` skill. "
-        f"Read `{report_path}` in `{repository}` at commit `{commit_sha}` "
-        "using GitHub MCP. Use that report, the implementation diff it references, "
-        "and the teaching brief and outline from this session."
-    )
-
-    def write_documentation():
-        #wait for teacher to interpret teaching-brief
-        preparation.result()
-        #job
-        return run_agent_turn(teacher_session_id, message)
-
-    #queue teacher documentation job
-    teacher_jobs[teacher_session_id] = teacher_executor.submit(
-        write_documentation
-    )
-    teacher_jobs[teacher_session_id].add_done_callback(log_job_result)
-
-    return teacher_session_id
-
-#http listening server
+# run mcp server -> allows agents to call tools
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")
