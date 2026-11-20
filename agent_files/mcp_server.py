@@ -1,155 +1,232 @@
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-#
 from threading import Lock
 from uuid import uuid4
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from trueforge_sdk import TrueForge
 from trueforge_sdk.types import UserMessage
 
+
 # servers
-mcp = FastMCP("Jelly Handoff", host="127.0.0.1", port=8000)
+mcp = FastMCP("Agent Communication", host="127.0.0.1", port=8000)
 client = TrueForge(base_url="http://localhost:8790", timeout=600)
 
-"""
-6 worker threads -> 1 per route
-threads allow us to execute and await agent turns in parallel
-"""
-executor = ThreadPoolExecutor(max_workers=6)
-"""
-works with pending dict -> prevents workers from modifying the dictionary at the same time
-only 1 thread worker can use the lock at a time -> other threads wait their turn
-"""
+# protects shared dictionary and queue updates
 state_lock = Lock()
 
-# agent -> agent
-Route = tuple[str, str]
-#message tuple
-QueuedMessage = tuple[str, str]  # Message ID and text
+# prevents duplicate session creation or registration
+session_creation_lock = Lock()
 
-# Each ordered pair gets its own recipient session.
-sessions: dict[Route, str] = {}
+# message id, sender, message
+QueuedMessage = tuple[str, str, str]
 
-# A route stays here while its worker is scheduled or running.
-#route: queue of messages
-pending: dict[Route, deque[QueuedMessage]] = {}
+# agent name -> session id
+sessions: dict[str, str] = {}
 
-# Maintains the latest commit SHA of respositories
-# Repository: latest verified origin/main commit SHA
-latest_commits: dict[str, str] = {}
+# agent name -> executor with 1 worker
+executors: dict[str, ThreadPoolExecutor] = {}
 
-# (Session ID, repository) -> last confirmed local checkout SHA
-session_commits: dict[tuple[str, str], str] = {}
+# agent name -> queue while its worker is scheduled or running
+pending: dict[str, deque[QueuedMessage]] = {}
 
+
+# fetch existing agent session or create one
+def get_agent_session(agent_name: str) -> str:
+    with session_creation_lock:
+        with state_lock:
+            session_id = sessions.get(agent_name)
+
+        if session_id is None:
+            session = client.sessions.create(agent={"name": agent_name})
+            session_id = session.data.id
+
+            with state_lock:
+                sessions[agent_name] = session_id
+
+    return session_id
+
+
+# executes one agent turn
 def run_agent_turn(session_id: str, message: str):
-    # create a stream -> send message to proper session
-    # with block ends stream after return
     with client.sessions.create_turn_stream(
         session_id=session_id,
         input=[UserMessage(content=message)],
     ) as events:
-        # process every return from recipient agent
         for event in events:
-            # after final turn, check for unsuccessful return
             if event.type == "turn.done":
-                if event.state.status != "done" or event.state.output is None:
+                if event.state.status != "done":
                     raise RuntimeError(
-                        f"Session {session_id} ended with status "
-                        f"{event.state.status} or returned no output."
+                        f"Session {session_id} ended with status: "
+                        f"{event.state.status}"
                     )
-                # success? -> return
+
+                # a completed turn may have no final text
+                if event.state.output is None:
+                    return None
+
                 return event.state.output.content
 
-    # never returned -> error
-    raise RuntimeError(f"Session {session_id} ended without a final event.")
+    raise RuntimeError(
+        f"Session {session_id} ended without a final event."
+    )
 
-# process all jobs in route queue 
-def process_route_jobs(route: Route) -> None:
-    sender, recipient = route
 
-    # process all jobs
+# process all messages queued for one agent
+def process_agent_jobs(agent_name: str, session_id: str) -> None:
     while True:
         with state_lock:
-            queue = pending[route]
-            # route's queue empty -> no more jobs -> remove queue
+            queue = pending[agent_name]
+
+            # no more messages -> release this agent's queue
             if not queue:
-                del pending[route]
-                #jobs processed -> return
+                del pending[agent_name]
                 return
 
-            #job waiting -> pop it
-            message_id, message = queue.popleft()
-            session_id = sessions.get(route)
+            message_id, sender, message = queue.popleft()
 
-        # Release the lock before calling TrueForge so other routes can run.
+        # release lock before waiting for the agent -> allows other workers to run jobs
         try:
-            #no history between agents -> create a route (session)
-            if session_id is None:
-                # new session with recipient agent
-                session = client.sessions.create(agent={"name": recipient})
-                session_id = session.data.id
-                # create route tied to session id
-                with state_lock:
-                    sessions[route] = session_id
-
-            # store reply of recipient agent, given the sender agent's message
-            output = run_agent_turn(
-                session_id,
-                message,
+            # identify the message's source for the recipient
+            incoming_message = (
+                f"Message ID: {message_id}\n"
+                f"From agent: {sender}\n\n"
+                f"{message}"
             )
+
+            run_agent_turn(session_id, incoming_message)
+
             print(
-                f"[{message_id}] {sender} -> {recipient} "
+                f"[{message_id}] {sender} -> {agent_name} "
                 f"({session_id}) completed",
                 flush=True,
             )
-        # log route and print error
+
+        # log failure -> continue processing later messages
         except Exception as error:
             print(
-                f"[{message_id}] {sender} -> {recipient} "
-                f"({session_id or 'no session'}) failed: {error}",
+                f"[{message_id}] {sender} -> {agent_name} "
+                f"({session_id}) failed: {error}",
                 flush=True,
             )
 
 
+# send a message without waiting for the recipient's response
 @mcp.tool()
-def communicate(sender: str, recipient: str, message: str) -> dict[str, str]:
+def communicate(
+    sender: str,
+    recipient: str,
+    message: str,
+) -> dict[str, str]:
     """
     Queue a message using exact TrueForge agent names.
 
-    A queued response confirms acceptance. Replies are sent across the route with reversed
-    sender and recipient
+    Returns immediately after submission, without waiting for execution.
+    To reply, call communicate with sender and recipient reversed.
+    A queued status confirms acceptance, not successful completion.
     """
     # format
     sender = sender.strip()
     recipient = recipient.strip()
-    # ensure info is provided
-    if not sender or not recipient or not message.strip():
-        raise ValueError("Sender, recipient, and message must all be provided.")
 
-    # create route, unique message id, and queued job
-    route = (sender, recipient)
+    #validate basic info
+    if not sender or not recipient or not message.strip():
+        raise ValueError(
+            "Sender, recipient, and message must all be provided."
+        )
+
+    # resolve recipient's session -> reused for all incoming messages
+    session_id = get_agent_session(recipient)
+
     message_id = uuid4().hex
-    queued_job = (message_id, message)
+    queued_job: QueuedMessage = (message_id, sender, message)
 
     with state_lock:
-        # worker processing jobs on route, append job
-        if route in pending:
-            pending[route].append(queued_job)
-        # no jobs running on route -> no worker
+        # existing worker will process this message
+        if recipient in pending:
+            pending[recipient].append(queued_job)
+
         else:
-            pending[route] = deque([queued_job])
+            # create 1 worker for this agent if needed
+            if recipient not in executors:
+                executors[recipient] = ThreadPoolExecutor(
+                    max_workers=1,
+                )
+
+            pending[recipient] = deque([queued_job])
+
             try:
-                # assign a worker to job queue to process it
-                executor.submit(process_route_jobs, route)
-            # error -> delete route (we dont want it to appear as if a worker has been assigned)
+                executors[recipient].submit(
+                    process_agent_jobs,
+                    recipient,
+                    session_id,
+                )
+
+            # submission failed -> remove queue so it can be retried
             except RuntimeError:
-                del pending[route]
-                # re-raise error for caller
+                del pending[recipient]
                 raise
 
-    return {"status": "queued", "message_id": message_id}
+    return {
+        "status": "queued",
+        "message_id": message_id,
+        "recipient": recipient,
+        "session_id": session_id,
+    }
 
-# run mcp server -> allows agents to call tools
+
+# register an existing conversation, such as the master-user session
+@mcp.tool()
+def register_agent_session(
+    agent_name: str,
+    ctx: Context,
+) -> dict[str, str]:
+    """
+    Register the calling TrueForge session under its exact agent name.
+
+    Call from the conversation that should receive future messages.
+    """
+    agent_name = agent_name.strip()
+
+    if not agent_name:
+        raise ValueError("Agent name must be provided.")
+
+    request = ctx.request_context.request
+
+    if request is None:
+        raise RuntimeError("No HTTP request context is available.")
+
+    session_id = request.headers.get("x-tfg-session-id")
+
+    if not session_id:
+        raise RuntimeError(
+            "TrueForge did not provide the calling session ID."
+        )
+
+    # coordinate registration with automatic session creation
+    with session_creation_lock:
+        with state_lock:
+            existing_session = sessions.get(agent_name)
+
+            # prevent switching destinations while messages are pending
+            if (
+                existing_session != session_id
+                and agent_name in pending
+            ):
+                raise RuntimeError(
+                    f"Cannot replace {agent_name}'s session "
+                    "while its queue is active."
+                )
+
+            sessions[agent_name] = session_id
+
+    return {
+        "status": "registered",
+        "agent": agent_name,
+        "session_id": session_id,
+    }
+
+
+# run HTTP server -> exposes the MCP tools
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")
